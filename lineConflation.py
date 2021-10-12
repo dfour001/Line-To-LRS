@@ -12,17 +12,33 @@ d = 50
 # LRS Layer
 lrs = r'C:\Users\daniel.fourquet\Documents\ArcGIS\LRS.gdb\SDE_VDOT_RTE_MASTER_LRS'
 
-arcpy.MakeFeatureLayer_management(lrs, 'memory\lrs_noRamps', "RTE_DIRECTION_CD = RTE_PRIME_DIRECTION_CD and rte_nm not like '%RMP%'")
-lrs_noRamps = 'memory\lrs_noRamps'
+# LRS Feature Layer - prime direction and no ramps:
+# arcpy.MakeFeatureLayer_management(lrs, 'memory\lrs_noRamps', "RTE_DIRECTION_CD = RTE_PRIME_DIRECTION_CD and rte_nm not like '%RMP%'")
+# lrs_noRamps = 'memory\lrs_noRamps'
 
+# No Ramps:
+# arcpy.MakeFeatureLayer_management(lrs, 'memory\lrs_noRamps', "rte_nm not like '%RMP%'")
+# lrs_noRamps = 'memory\lrs_noRamps'
+
+# All LRS
+arcpy.MakeFeatureLayer_management(lrs, 'lrsAll', "RTE_DIRECTION_CD = RTE_PRIME_DIRECTION_CD")
+lrs_noRamps = "lrsAll"
+
+
+# Only Ramps:
 arcpy.MakeFeatureLayer_management(lrs, 'memory\lrs_onlyRamps', "rte_nm like '%RMP%'")
 lrs_onlyRamps = 'memory\lrs_onlyRamps'
+
+# LRS Intersections
+Intersections = r'C:\Users\daniel.fourquet\Documents\ArcGIS\LRS.gdb\SDE_VDOT_INTERSECTION_W_XY'
+lyrIntersections = "lyrIntersections"
+arcpy.MakeFeatureLayer_management(Intersections, lyrIntersections)
 
 # Input lines file path
 inputLines = r'C:\Users\daniel.fourquet\Desktop\Tasks\XD Speed Limits for JJ\data.gdb\RequiredXDs'
 
 # Output CSV file path
-outputPath = r'C:\Users\daniel.fourquet\Documents\GitHub\Line-To-LRS\testData\requiredXDsEvents.csv'
+outputPath = r'C:\Users\daniel.fourquet\Documents\GitHub\Line-To-LRS\testData\SpeedLimitTest.csv'
 
 
 
@@ -31,7 +47,7 @@ events = []
 
 # Set up logging
 log = logging.getLogger(__name__)
-log.setLevel(logging.DEBUG) # Set the debug level here
+log.setLevel(logging.DEBUG) # Set the debug level herec
 fileHandler = logging.FileHandler(r'C:\Users\daniel.fourquet\Documents\GitHub\Line-To-LRS\testData\test.log', mode='w')
 log.addHandler(fileHandler)
 
@@ -80,6 +96,34 @@ def get_hausdorff(testGeom, routeGeom):
     return hausdorff
 
 
+def move_to_closest_int(testGeom, testDistance=30):
+    testPointGeom = arcpy.PointGeometry(testGeom, arcpy.SpatialReference(3857))
+    arcpy.SelectLayerByLocation_management(lyrIntersections, "INTERSECT", testPointGeom, testDistance)
+    intersections = [row[0] for row in arcpy.da.SearchCursor(lyrIntersections, "SHAPE@")]
+    if len(intersections) == 0:
+        log.debug(f"No intersections within {testDistance}m distance.  Returning testGeom.")
+        return testGeom
+    
+    if len(intersections) == 1:
+        log.debug(f"One intersection within {testDistance}m distance.  Returning intersection at {intersections[0].firstPoint.X}, {intersections[0].firstPoint.Y}.")
+        return intersections[0].firstPoint
+
+    log.debug(f"{len(intersections)} intersections found.  Returning closest intersection.")
+    closestInt = intersections[0]
+    closestIntDist = testDistance
+    for intersection in intersections:
+        dist = testPointGeom.distanceTo(intersection)
+        if dist < closestIntDist:
+            closestInt = intersection
+            closestIntDist = dist
+    
+    log.debug(f"Returning intersection at {closestInt.firstPoint.X}, {closestInt.firstPoint.Y}")
+    return closestInt.firstPoint
+
+    
+
+
+
 def get_msr(testGeom, lrs, rte_nm):
     with arcpy.da.SearchCursor(lrs, "SHAPE@", "RTE_NM = '{}'".format(rte_nm)) as cur:
         for row in cur:
@@ -92,9 +136,20 @@ def get_msr(testGeom, lrs, rte_nm):
         return mp
 
     beginPt = testGeom.firstPoint
-    beginMP = get_mp_from_point(RouteGeom, beginPt)
+    beginClosestPt = move_to_closest_int(beginPt)
+    
 
     endPt = testGeom.lastPoint
+    endClosestPt = move_to_closest_int(endPt)
+
+    if beginClosestPt.X != endClosestPt.X and beginClosestPt.Y != endClosestPt.Y:
+        log.debug("Begin/End Closest Point are not equal")
+        beginPt = beginClosestPt
+        endPt = endClosestPt
+    else:
+        log.debug("BEGIN/END CLOSEST POINT ARE EQUAL")
+
+    beginMP = get_mp_from_point(RouteGeom, beginPt)
     endMP = get_mp_from_point(RouteGeom, endPt)
 
     return round(beginMP, 3), round(endMP, 3)
@@ -220,10 +275,19 @@ def create_events(testGeom, ID, lrs, rte_nbr=-1, ):
         add_event(testGeom, ID, None)
     else:
         potentialRouteMatches[0].matchScoreNormalized = 1
+
+    ramp = False
+    if 'RMP' in potentialRouteMatches[0].rte_nm:
+        # This event most likely represents a ramp, so only ramp routes should be matched
+        ramp = True
     
     for potentialRouteMatch in potentialRouteMatches:
         if potentialRouteMatch.matchScoreNormalized <= 10:
-            add_event(testGeom, ID, potentialRouteMatch.rte_nm)
+            if ramp:
+                if 'RMP' in potentialRouteMatch.rte_nm:
+                    add_event(testGeom, ID, potentialRouteMatch.rte_nm)
+            else:
+                add_event(testGeom, ID, potentialRouteMatch.rte_nm)
             
 
 
@@ -231,7 +295,6 @@ def create_events(testGeom, ID, lrs, rte_nbr=-1, ):
 if __name__ == '__main__':
 
     # Configuration for XD-LRS conflation:
-
     startTime = datetime.now()
     print(f'Start time: {startTime}')
     XDnonRamps = [row[0] for row in arcpy.da.SearchCursor(inputLines, ["XDSegID", "SlipRoad", "SHAPE@LENGTH"]) if row[1] != '1' or (row[1] == '1' and row[2] > 0.009)]
@@ -244,11 +307,12 @@ if __name__ == '__main__':
         try:
             testGeom, RoadNumber = [(row[0], row[1]) for row in arcpy.da.SearchCursor(inputLines, ["SHAPE@", 'RoadNumber'], f"XDSegID = {testID}")][0]
             create_events(testGeom, testID,  lrs_noRamps, RoadNumber)
-        except:
+        except Exception as e:
+            print(e)
             print(f'Error processing {testID}')
 
         percent = f'{i / len(XDnonRamps) * 100}%'
-        print(percent)
+        print(round(percent))
 
 
     # Process Ramps
@@ -262,7 +326,7 @@ if __name__ == '__main__':
             print(f'Error processing {testID}')
 
         percent = f'{i / len(XDramps) * 100}%'
-        print(percent)
+        print(round(percent))
 
     outputDF = pd.DataFrame(events)
     outputDF.to_csv(outputPath, index=False)
